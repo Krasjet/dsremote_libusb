@@ -35,10 +35,13 @@
 extern "C" {
 #endif
 
+#include <libusb-1.0/libusb.h>
 
 struct tmcdev
 {
-  int fd;
+  libusb_device_handle *hndl;
+  libusb_device *dev;
+  unsigned char btag;
   char *hdrbuf;
   char *buf;
   int sz;

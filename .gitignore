@@ -1,0 +1,6 @@
+moc/
+objects/
+qrc_images.cpp
+dsremote
+.qmake.stash
+Makefile

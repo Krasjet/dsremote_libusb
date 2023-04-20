@@ -10,7 +10,7 @@ Compiling and installing on Ubuntu Linux and derivatives:
 ---------------------------------------------------------
 
 sudo apt-get update
-sudo apt-get install g++ make git qtbase5-dev-tools qtbase5-dev qt5-default
+sudo apt-get install g++ make git qtbase5-dev-tools qtbase5-dev qt5-default libusb-1.0-0-dev
 git clone https://gitlab.com/Teuniz/DSRemote.git
 cd DSRemote
 qmake

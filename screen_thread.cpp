@@ -775,6 +775,7 @@ void screen_thread::run()
         goto OUT_ERROR;
       }
 
+      usleep(30000); // read immediately will cause hang
       n = tmc_read();
 
       if(n < 0)

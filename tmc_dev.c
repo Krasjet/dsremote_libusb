@@ -26,13 +26,10 @@
 */
 
 
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <linux/usb/tmc.h>
 #include <stdio.h>
-#include <errno.h>
 
 #include "tmc_dev.h"
 #include "utils.h"
@@ -40,13 +37,22 @@
 
 
 #define MAX_CMD_LEN     (255)
-#define MAX_RESP_LEN    (1024 * 1024 * 2)
+#define MAX_TRANSFER_LEN    (1024 * 1024 * 2)
+#define USBTMC_TIMEOUT 5000
+
+
+// to get bulk in/out endpoint
+//   $ lsusb -v -d 1ab1:0517
+#define EP_OUT 0x03
+#define EP_IN  0x82
 
 
 
 struct tmcdev * tmcdev_open(const char *device)
 {
   struct tmcdev *dev;
+
+  (void)device;
 
 
   dev = (struct tmcdev *)calloc(1, sizeof(struct tmcdev));
@@ -55,7 +61,7 @@ struct tmcdev * tmcdev_open(const char *device)
     return NULL;
   }
 
-  dev->hdrbuf = (char *)calloc(1, MAX_RESP_LEN + 1024);
+  dev->hdrbuf = (char *)calloc(1, MAX_TRANSFER_LEN + 1024);
   if(dev->hdrbuf == NULL)
   {
     free(dev);
@@ -65,9 +71,11 @@ struct tmcdev * tmcdev_open(const char *device)
 
   dev->buf = dev->hdrbuf;
 
-  dev->fd = open(device, O_RDWR);
+  libusb_init(NULL);
+  // hardcode DS1102Z-E
+  dev->hndl = libusb_open_device_with_vid_pid(NULL, 0x1ab1, 0x0517);
 
-  if(dev->fd == -1)
+  if(dev->hndl == NULL)
   {
     free(dev->hdrbuf);
 
@@ -75,6 +83,10 @@ struct tmcdev * tmcdev_open(const char *device)
 
     return NULL;
   }
+
+  dev->dev = libusb_get_device(dev->hndl);
+  libusb_set_auto_detach_kernel_driver(dev->hndl, 1);
+  libusb_claim_interface(dev->hndl, 0x00);
 
   return dev;
 }
@@ -87,13 +99,150 @@ void tmcdev_close(struct tmcdev *dev)
     return;
   }
 
-  close(dev->fd);
+  libusb_release_interface(dev->hndl, 0x00);
+  libusb_close(dev->hndl);
+  libusb_exit(NULL);
 
   free(dev->hdrbuf);
 
   free(dev);
 }
 
+// convenience struct for usbtmc, modified from tinyusb
+typedef enum {
+  USBTMC_MSGID_DEV_DEP_MSG_OUT = 1u,
+  USBTMC_MSGID_DEV_DEP_MSG_IN = 2u,
+} usbtmc_msgid_enum;
+
+typedef struct
+{
+  uint8_t MsgID;
+  uint8_t bTag;
+  uint8_t bTagInverse;
+  uint8_t _reserved;
+} usbtmc_msg_header_t;
+
+typedef struct
+{
+  usbtmc_msg_header_t header;
+  uint32_t TransferSize;
+  uint8_t  EOM;
+  uint8_t _reserved[3];
+} usbtmc_msg_request_dev_dep_out;
+
+typedef struct
+{
+  usbtmc_msg_header_t header;
+  uint32_t TransferSize;
+  uint8_t TermCharEnabled;
+  uint8_t TermChar;
+  uint8_t _reserved[2];
+} usbtmc_msg_request_dev_dep_in;
+
+typedef struct
+{
+  usbtmc_msg_header_t header;
+  uint32_t TransferSize;
+  uint8_t bmTransferAttributes;
+  uint8_t _reserved[3];
+} usbtmc_msg_dev_dep_msg_in_header_t;
+
+static int usbtmc_write(struct tmcdev *dev, char *buf, size_t n)
+{
+  /* assume message length always smaller than max transfer len */
+  uint8_t buf_raw[MAX_TRANSFER_LEN + sizeof(usbtmc_msg_request_dev_dep_out)+3];
+
+  // assume little endian
+  dev->btag = (dev->btag % 255) + 1;
+  usbtmc_msg_request_dev_dep_out out_hdr = {
+    .header = {
+      .MsgID = USBTMC_MSGID_DEV_DEP_MSG_OUT,
+      .bTag = dev->btag,
+      .bTagInverse = ~dev->btag & 0xFF,
+      ._reserved = 0x00
+    },
+    .TransferSize = n,
+    .EOM = 0x01,
+    ._reserved = {0x00}
+  };
+
+  int m = 0;
+
+  memcpy(buf_raw, &out_hdr, sizeof(usbtmc_msg_request_dev_dep_out));
+  m += sizeof(usbtmc_msg_request_dev_dep_out);
+  memcpy(buf_raw+m, buf, n);
+  m += n;
+
+  size_t pad = (4-(n % 4)%4);
+  while (pad-- > 0)
+    buf_raw[m++] = 0;
+
+  int rc;
+  int actual_len;
+
+  rc = libusb_bulk_transfer(dev->hndl, EP_OUT, buf_raw, m, &actual_len, USBTMC_TIMEOUT);
+  if (rc < 0 || actual_len != m)
+    return -1;
+
+  return n;
+}
+
+static int usbtmc_read(struct tmcdev *dev, char *buf, size_t n, int initial)
+{
+  /* assume message length always smaller than max transfer len */
+  uint8_t bufrecv_raw[MAX_TRANSFER_LEN + sizeof(usbtmc_msg_dev_dep_msg_in_header_t)+3];
+  int rc;
+  int actual_len;
+
+  // send usbtmc bulk in header
+  size_t read_len = MAX_TRANSFER_LEN;
+  if (n < read_len)
+    read_len = n;
+
+  if (initial) {
+    // assume little endian
+    dev->btag = (dev->btag % 255) + 1;
+    usbtmc_msg_request_dev_dep_in in_hdr = {
+      .header = {
+        .MsgID = USBTMC_MSGID_DEV_DEP_MSG_IN,
+        .bTag = dev->btag,
+        .bTagInverse = ~dev->btag & 0xFF,
+        ._reserved = 0x00
+      },
+      .TransferSize = read_len,
+      .TermCharEnabled = 0x00,
+      .TermChar = 0x00,
+      ._reserved = {0x00}
+    };
+
+    int m = sizeof(usbtmc_msg_request_dev_dep_in);
+    rc = libusb_bulk_transfer(dev->hndl, EP_OUT, (void*)&in_hdr, m, &actual_len, USBTMC_TIMEOUT);
+    if (rc < 0 || actual_len != m)
+      return -1;
+  }
+
+  // read data
+  int m = read_len+sizeof(usbtmc_msg_dev_dep_msg_in_header_t)+3;
+  rc = libusb_bulk_transfer(dev->hndl, EP_IN, bufrecv_raw, m, &actual_len, USBTMC_TIMEOUT);
+  if (rc < 0 || actual_len < 0)
+    return -1;
+
+  if (initial) {
+    usbtmc_msg_dev_dep_msg_in_header_t resp_hdr;
+    memcpy(&resp_hdr, bufrecv_raw, sizeof(resp_hdr));
+    size_t transfer_size = resp_hdr.TransferSize;
+    if (bufrecv_raw[sizeof(resp_hdr)] == '#') {
+      transfer_size = actual_len-sizeof(resp_hdr);
+      if (transfer_size > resp_hdr.TransferSize)
+        transfer_size = resp_hdr.TransferSize;
+    }
+    memcpy(buf, bufrecv_raw+sizeof(resp_hdr), transfer_size);
+    return transfer_size;
+  }
+
+  memcpy(buf, bufrecv_raw, actual_len);
+  return actual_len;
+}
 
 int tmcdev_write(struct tmcdev *dev, const char *cmd)
 {
@@ -157,7 +306,7 @@ int tmcdev_write(struct tmcdev *dev, const char *cmd)
     qry = 1;
   }
 
-  n = write(dev->fd, buf, strlen(buf));
+  n = usbtmc_write(dev, buf, strlen(buf));
 
   if(n != (len + 1))
   {
@@ -172,7 +321,7 @@ int tmcdev_write(struct tmcdev *dev, const char *cmd)
     {
       usleep(25000);
 
-      n = write(dev->fd, "*OPC?\n", 6);
+      n = usbtmc_write(dev, "*OPC?\n", 6);
 
       if(n < 0)
       {
@@ -181,7 +330,7 @@ int tmcdev_write(struct tmcdev *dev, const char *cmd)
         return -1;
       }
 
-      n = read(dev->fd, str, 128);
+      n = usbtmc_read(dev, str, 128, 1);
 
       if(n < 0)
       {
@@ -230,9 +379,9 @@ int tmcdev_read(struct tmcdev *dev)
 
   dev->sz = 0;
 
-  size = read(dev->fd, dev->hdrbuf, MAX_RESP_LEN);
+  size = usbtmc_read(dev, dev->hdrbuf, MAX_TRANSFER_LEN, 1);
 
-  if((size < 2) || (size > MAX_RESP_LEN))
+  if((size < 2) || (size > MAX_TRANSFER_LEN))
   {
     dev->hdrbuf[0] = 0;
 
@@ -270,11 +419,11 @@ int tmcdev_read(struct tmcdev *dev)
 
   blockhdr[len + 2] = 0;
 
-  size2 = atoi(blockhdr + 2);
+  size2 = atoi(blockhdr + 2) + len + 2;
 
-  while(size < size2 && size<MAX_RESP_LEN) // we did not get all the data
+  while(size < size2 && size<MAX_TRANSFER_LEN) // we did not get all the data
   {
-    ssize_t read_size = read(dev->fd, &dev->hdrbuf[size], MAX_RESP_LEN - size);
+    ssize_t read_size = usbtmc_read(dev, &dev->hdrbuf[size], MAX_TRANSFER_LEN - size, 0);
     if(read_size < 1) // timeout or error occurred
     {
       blockhdr[31] = 0;
@@ -296,7 +445,7 @@ int tmcdev_read(struct tmcdev *dev)
 
   dev->buf = dev->hdrbuf + len + 2;
 
-  dev->sz = size2;
+  dev->sz = size2 - len - 2;
 
   return dev->sz;
 }

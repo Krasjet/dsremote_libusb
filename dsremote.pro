@@ -140,4 +140,4 @@ udev_rule.path += /etc/udev/rules.d
 udev_rule.files += install/30-usbtmc.rules
 INSTALLS += udev_rule
 
-
+LIBS += -lusb-1.0
